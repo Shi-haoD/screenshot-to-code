@@ -1,25 +1,46 @@
 import React from "react";
-import ImageUpload from "../ImageUpload";
-import { UrlInputSection } from "../UrlInputSection";
-import ImportCodeSection from "../ImportCodeSection";
-import { Settings } from "../../types";
+import { DesignSystem, Settings } from "../../types";
 import { Stack } from "../../lib/stacks";
+import UnifiedInputPane from "../unified-input/UnifiedInputPane";
 
 interface Props {
-  doCreate: (images: string[], inputMode: "image" | "video") => void;
+  doCreate: (
+    images: string[],
+    inputMode: "image" | "video",
+    textPrompt?: string,
+    isAssetExtractionEnabled?: boolean
+  ) => void;
+  doCreateFromText: (text: string) => void;
   importFromCode: (code: string, stack: Stack) => void;
   settings: Settings;
+  setSettings: React.Dispatch<React.SetStateAction<Settings>>;
+  designSystems: DesignSystem[];
+  onAddNewDesignSystem: () => void;
+  onManageDesignSystems: () => void;
 }
 
-const StartPane: React.FC<Props> = ({ doCreate, importFromCode, settings }) => {
+const StartPane: React.FC<Props> = ({
+  doCreate,
+  doCreateFromText,
+  importFromCode,
+  settings,
+  setSettings,
+  designSystems,
+  onAddNewDesignSystem,
+  onManageDesignSystems,
+}) => {
   return (
-    <div className="flex flex-col justify-center items-center gap-y-10">
-      <ImageUpload setReferenceImages={doCreate} />
-      <UrlInputSection
+    <div className="flex flex-col justify-center items-center py-8">
+      <UnifiedInputPane
         doCreate={doCreate}
-        screenshotOneApiKey={settings.screenshotOneApiKey}
+        doCreateFromText={doCreateFromText}
+        importFromCode={importFromCode}
+        settings={settings}
+        setSettings={setSettings}
+        designSystems={designSystems}
+        onAddNewDesignSystem={onAddNewDesignSystem}
+        onManageDesignSystems={onManageDesignSystems}
       />
-      <ImportCodeSection importFromCode={importFromCode} />
     </div>
   );
 };

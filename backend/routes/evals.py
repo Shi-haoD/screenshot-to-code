@@ -1,15 +1,23 @@
 import os
+import asyncio
+import json
 from fastapi import APIRouter, Query, Request, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from evals.utils import image_to_data_url
 from evals.config import EVALS_DIR
-from typing import Set
-from evals.runner import run_image_evals
+from typing import Optional, Set
+from evals.runner import run_image_evals, count_pending_eval_tasks
+from evals import sessions as eval_sessions
+from evals import sets as eval_sets
 from typing import List, Dict
 from llm import Llm
-from prompts.types import Stack
+from prompts.prompt_types import Stack
 from pathlib import Path
-import base64
+from fs_logging.openai_input_compare import (
+    compare_openai_inputs,
+    format_openai_input_comparison,
+)
 
 router = APIRouter()
 
@@ -20,6 +28,28 @@ N = 1
 class Eval(BaseModel):
     input: str
     outputs: list[str]
+
+
+class InputFile(BaseModel):
+    name: str
+    path: str
+
+
+@router.get("/eval_input_files", response_model=List[InputFile])
+async def get_eval_input_files():
+    """Get a list of all input files available for evaluations"""
+    input_dir = os.path.join(EVALS_DIR, "inputs")
+    try:
+        files: list[InputFile] = []
+        for filename in os.listdir(input_dir):
+            if filename.endswith(".png"):
+                file_path = os.path.join(input_dir, filename)
+                files.append(InputFile(name=filename, path=file_path))
+        return sorted(files, key=lambda x: x.name)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error reading input files: {str(e)}"
+        )
 
 
 @router.get("/evals", response_model=list[Eval])
@@ -74,114 +104,289 @@ async def get_evals(folder: str):
         raise HTTPException(status_code=500, detail=f"Error processing evals: {str(e)}")
 
 
-class PairwiseEvalResponse(BaseModel):
-    evals: list[Eval]
-    folder1_name: str
-    folder2_name: str
-
-
-@router.get("/pairwise-evals", response_model=PairwiseEvalResponse)
-async def get_pairwise_evals(
-    folder1: str = Query(
-        "...",
-        description="Absolute path to first folder",
-    ),
-    folder2: str = Query(
-        "..",
-        description="Absolute path to second folder",
-    ),
-):
-    if not os.path.exists(folder1) or not os.path.exists(folder2):
-        return {"error": "One or both folders do not exist"}
-
-    evals: list[Eval] = []
-
-    # Get all HTML files from first folder
-    files1 = {
-        f: os.path.join(folder1, f) for f in os.listdir(folder1) if f.endswith(".html")
-    }
-    files2 = {
-        f: os.path.join(folder2, f) for f in os.listdir(folder2) if f.endswith(".html")
-    }
-
-    # Find common base names (ignoring any suffixes)
-    common_names: Set[str] = set()
-    for f1 in files1.keys():
-        base_name: str = f1.rsplit("_", 1)[0] if "_" in f1 else f1.replace(".html", "")
-        for f2 in files2.keys():
-            if f2.startswith(base_name):
-                common_names.add(base_name)
-
-    # For each matching pair, create an eval
-    for base_name in common_names:
-        # Find the corresponding input image
-        input_image = None
-        input_path = os.path.join(EVALS_DIR, "inputs", f"{base_name}.png")
-        if os.path.exists(input_path):
-            input_image = await image_to_data_url(input_path)
-        else:
-            input_image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="  # 1x1 transparent PNG
-
-        # Get the HTML contents
-        output1 = None
-        output2 = None
-
-        # Find matching files in folder1
-        for f1 in files1.keys():
-            if f1.startswith(base_name):
-                with open(files1[f1], "r") as f:
-                    output1 = f.read()
-                break
-
-        # Find matching files in folder2
-        for f2 in files2.keys():
-            if f2.startswith(base_name):
-                with open(files2[f2], "r") as f:
-                    output2 = f.read()
-                break
-
-        if output1 and output2:
-            evals.append(Eval(input=input_image, outputs=[output1, output2]))
-
-    # Extract folder names for the UI
-    folder1_name = os.path.basename(folder1)
-    folder2_name = os.path.basename(folder2)
-
-    return PairwiseEvalResponse(
-        evals=evals, folder1_name=folder1_name, folder2_name=folder2_name
-    )
-
-
 class RunEvalsRequest(BaseModel):
     models: List[str]
     stack: Stack
+    files: List[str] = []  # Optional list of specific file paths to run evals on
+    diff_mode: bool = False
+    # When set, inputs come from {EVALS_DIR}/sets/{set_name}/inputs and runs
+    # attach to the active eval session (auto-created when none exists).
+    set_name: Optional[str] = None
+
+
+def _resolve_set_run(
+    request: RunEvalsRequest,
+) -> tuple[Optional[str], Optional[eval_sessions.EvalSession], Dict[str, set[str]]]:
+    """Validate the requested set and resolve the session + per-model skips."""
+    if not request.set_name:
+        return None, None, {}
+    try:
+        set_info = eval_sets.get_set(request.set_name)
+    except eval_sets.InvalidSetNameError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except eval_sets.EvalSetNotFoundError:
+        raise HTTPException(
+            status_code=404, detail=f"Eval set not found: {request.set_name}"
+        )
+    if set_info.image_count == 0:
+        raise HTTPException(
+            status_code=400, detail=f"Eval set {request.set_name!r} has no images"
+        )
+    try:
+        session = eval_sessions.resolve_session_for_run(request.set_name)
+    except eval_sessions.SessionSetMismatchError as e:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Active session {e.active_session.name!r} is pinned to set "
+                f"{e.active_session.eval_set!r}. Start a new session for set "
+                f"{request.set_name!r} first (POST /eval-sessions)."
+            ),
+        )
+    skip_per_model: Dict[str, set[str]] = {}
+    if request.diff_mode:
+        for model in request.models:
+            skip_per_model[model] = eval_sessions.completed_eval_inputs(
+                session.session_id, model, str(request.stack)
+            )
+    return request.set_name, session, skip_per_model
+
+
+class OpenAIInputCompareRequest(BaseModel):
+    left_json: str
+    right_json: str
+
+
+class OpenAIInputCompareDifferenceResponse(BaseModel):
+    item_index: int
+    path: str
+    left_summary: str
+    right_summary: str
+    left_value: object | None
+    right_value: object | None
+
+
+class OpenAIInputCompareResponse(BaseModel):
+    common_prefix_items: int
+    left_item_count: int
+    right_item_count: int
+    difference: OpenAIInputCompareDifferenceResponse | None
+    formatted: str
+
+
+def _load_openai_input_compare_payload(raw_json: str, side: str) -> object:
+    try:
+        payload = json.loads(raw_json)
+    except json.JSONDecodeError as error:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Invalid {side} JSON: {error.msg} "
+                f"(line {error.lineno}, column {error.colno})"
+            ),
+        )
+
+    try:
+        compare_openai_inputs(payload, payload)
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=f"Invalid {side} payload: {error}")
+
+    return payload
+
+
+@router.post("/openai-input-compare", response_model=OpenAIInputCompareResponse)
+async def compare_openai_inputs_for_evals(
+    request: OpenAIInputCompareRequest,
+) -> OpenAIInputCompareResponse:
+    left_payload = _load_openai_input_compare_payload(request.left_json, "left")
+    right_payload = _load_openai_input_compare_payload(request.right_json, "right")
+    comparison = compare_openai_inputs(left_payload, right_payload)
+
+    difference = None
+    if comparison.difference is not None:
+        difference = OpenAIInputCompareDifferenceResponse(
+            item_index=comparison.difference.item_index,
+            path=comparison.difference.path,
+            left_summary=comparison.difference.left_summary,
+            right_summary=comparison.difference.right_summary,
+            left_value=comparison.difference.left_value,
+            right_value=comparison.difference.right_value,
+        )
+
+    return OpenAIInputCompareResponse(
+        common_prefix_items=comparison.common_prefix_items,
+        left_item_count=comparison.left_item_count,
+        right_item_count=comparison.right_item_count,
+        difference=difference,
+        formatted=format_openai_input_comparison(comparison),
+    )
 
 
 @router.post("/run_evals", response_model=List[str])
 async def run_evals(request: RunEvalsRequest) -> List[str]:
-    """Run evaluations on all images in the inputs directory for multiple models"""
+    """Run evaluations on selected images in the inputs directory for multiple models"""
+    eval_set, session, skip_per_model = _resolve_set_run(request)
     all_output_files: List[str] = []
 
     for model in request.models:
-        output_files = await run_image_evals(model=model, stack=request.stack)
+        output_files = await run_image_evals(
+            model=model,
+            stack=request.stack,
+            input_files=request.files,
+            diff_mode=request.diff_mode,
+            eval_set=eval_set,
+            eval_session_id=session.session_id if session else None,
+            skip_input_files=skip_per_model.get(model),
+        )
         all_output_files.extend(output_files)
 
     return all_output_files
 
 
+def _count_eval_files(selected_files: List[str], set_name: Optional[str] = None) -> int:
+    if set_name and eval_sets.get_set_kind(set_name) == "text":
+        brief_ids = {b.id for b in eval_sets.list_set_briefs(set_name)}
+        if selected_files:
+            return len([f for f in selected_files if f in brief_ids])
+        return len(brief_ids)
+
+    if selected_files:
+        return len([f for f in selected_files if f.endswith(".png")])
+
+    if set_name:
+        return len(eval_sets.list_set_images(set_name))
+
+    input_dir = os.path.join(EVALS_DIR, "inputs")
+    return len([f for f in os.listdir(input_dir) if f.endswith(".png")])
+
+
+@router.post("/run_evals_stream")
+async def run_evals_stream(request: RunEvalsRequest):
+    """Run evaluations and stream progress events as newline-delimited JSON."""
+    if not request.models:
+        raise HTTPException(status_code=400, detail="At least one model is required")
+
+    eval_set, session, skip_per_model = _resolve_set_run(request)
+
+    per_model_task_counts: Dict[str, int] = {}
+    per_model_skipped_existing: Dict[str, int] = {}
+    if request.diff_mode:
+        for model in request.models:
+            pending_tasks, skipped_tasks = count_pending_eval_tasks(
+                stack=request.stack,
+                model=model,
+                input_files=request.files,
+                n=N,
+                diff_mode=True,
+                eval_set=eval_set,
+                skip_input_files=skip_per_model.get(model),
+            )
+            per_model_task_counts[model] = pending_tasks
+            per_model_skipped_existing[model] = skipped_tasks
+    else:
+        per_model_task_count = _count_eval_files(request.files, eval_set)
+        for model in request.models:
+            per_model_task_counts[model] = per_model_task_count
+            per_model_skipped_existing[model] = 0
+
+    total_tasks = sum(per_model_task_counts.values())
+    total_skipped_existing = sum(per_model_skipped_existing.values())
+
+    async def event_generator():
+        queue: asyncio.Queue[dict] = asyncio.Queue()
+
+        async def emit(event: dict) -> None:
+            await queue.put(event)
+
+        async def run_all_models() -> None:
+            all_output_files: List[str] = []
+            completed_offset = 0
+
+            try:
+                await emit(
+                    {
+                        "type": "start",
+                        "total_models": len(request.models),
+                        "tasks_per_model": per_model_task_counts,
+                        "total_tasks": total_tasks,
+                        "completed_tasks": 0,
+                        "diff_mode": request.diff_mode,
+                        "total_skipped_existing": total_skipped_existing,
+                        "eval_set": eval_set,
+                        "eval_session_id": session.session_id if session else None,
+                        "eval_session_name": session.name if session else None,
+                    }
+                )
+
+                for model_index, model in enumerate(request.models, start=1):
+                    model_task_count = per_model_task_counts.get(model, 0)
+                    model_skipped_existing = per_model_skipped_existing.get(model, 0)
+                    await emit(
+                        {
+                            "type": "model_start",
+                            "model": model,
+                            "model_index": model_index,
+                            "total_models": len(request.models),
+                            "model_tasks": model_task_count,
+                            "model_skipped_existing": model_skipped_existing,
+                        }
+                    )
+
+                    async def on_progress(event: dict) -> None:
+                        await emit(
+                            {
+                                **event,
+                                "model": model,
+                                "model_index": model_index,
+                                "total_models": len(request.models),
+                                "global_completed_tasks": completed_offset
+                                + event.get("completed_tasks", 0),
+                                "global_total_tasks": total_tasks,
+                            }
+                        )
+
+                    output_files = await run_image_evals(
+                        model=model,
+                        stack=request.stack,
+                        input_files=request.files,
+                        diff_mode=request.diff_mode,
+                        progress_callback=on_progress,
+                        eval_set=eval_set,
+                        eval_session_id=session.session_id if session else None,
+                        skip_input_files=skip_per_model.get(model),
+                    )
+                    all_output_files.extend(output_files)
+                    completed_offset += model_task_count
+
+                await emit(
+                    {
+                        "type": "complete",
+                        "completed_tasks": total_tasks,
+                        "total_tasks": total_tasks,
+                        "output_files": all_output_files,
+                    }
+                )
+            except Exception as e:
+                await emit({"type": "error", "message": str(e)})
+            finally:
+                await emit({"type": "done"})
+
+        producer = asyncio.create_task(run_all_models())
+        while True:
+            event = await queue.get()
+            if event.get("type") == "done":
+                break
+            yield json.dumps(event) + "\n"
+        await producer
+
+    return StreamingResponse(event_generator(), media_type="application/x-ndjson")
+
+
 @router.get("/models", response_model=Dict[str, List[str]])
 async def get_models():
-    current_models = [
-        model.value
-        for model in Llm
-        if model != Llm.GPT_4_TURBO_2024_04_09
-        and model != Llm.GPT_4_VISION
-        and model != Llm.CLAUDE_3_SONNET
-        and model != Llm.CLAUDE_3_OPUS
-        and model != Llm.CLAUDE_3_HAIKU
-    ]
+    current_models = [model.value for model in Llm]
 
-    # Import Stack type from prompts.types and get all literal values
+    # Import Stack type from prompts.prompt_types and get all literal values
     available_stacks = list(Stack.__args__)
 
     return {"models": current_models, "stacks": available_stacks}
@@ -198,7 +403,7 @@ async def get_best_of_n_evals(request: Request):
     query_params = dict(request.query_params)
 
     # Extract all folder paths (folder1, folder2, folder3, etc.)
-    folders = []
+    folders: list[str] = []
     i = 1
     while f"folder{i}" in query_params:
         folders.append(query_params[f"folder{i}"])
@@ -252,9 +457,9 @@ async def get_best_of_n_evals(request: Request):
             input_image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII="
 
         # Get HTML contents from all folders
-        outputs = []
+        outputs: list[str] = []
         for folder_files in files_by_folder:
-            output_content = None
+            output_content: str | None = None
             for filename in folder_files.keys():
                 if filename.startswith(base_name):
                     with open(folder_files[filename], "r") as f:
@@ -269,3 +474,34 @@ async def get_best_of_n_evals(request: Request):
             evals.append(Eval(input=input_image, outputs=outputs))
 
     return BestOfNEvalsResponse(evals=evals, folder_names=folder_names)
+
+
+class OutputFolder(BaseModel):
+    name: str
+    path: str
+    modified_time: float
+
+
+@router.get("/output_folders", response_model=List[OutputFolder])
+async def get_output_folders():
+    """Get a list of all output folders available for evaluations, sorted by recently modified"""
+    output_dir = os.path.join(EVALS_DIR, "results")
+    try:
+        folders: list[OutputFolder] = []
+        for folder_name in os.listdir(output_dir):
+            folder_path = os.path.join(output_dir, folder_name)
+            if os.path.isdir(folder_path) and not folder_name.startswith("."):
+                # Get modification time
+                modified_time = os.path.getmtime(folder_path)
+                folders.append(
+                    OutputFolder(
+                        name=folder_name, path=folder_path, modified_time=modified_time
+                    )
+                )
+
+        # Sort by modified time, most recent first
+        return sorted(folders, key=lambda x: x.modified_time, reverse=True)
+    except Exception as e:
+        raise HTTPException(
+            status_code=500, detail=f"Error reading output folders: {str(e)}"
+        )

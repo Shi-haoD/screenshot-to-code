@@ -1,9 +1,13 @@
 .aider*
+node_modules
 
 # Project-related files
 
 # Run logs
-backend/run_logs/*
+run_logs/
+backend/local_assets/*
+backend/image_generation/eval_sets/*
+backend/image_generation/eval_results/*
 
 # Weird Docker setup related files
 backend/backend/*
@@ -14,3 +18,9 @@ frontend/.env.local
 
 # Mac files
 .DS_Store
+
+#Rodney
+.rodney
+
+# Walkthrough demo videos
+walkthrough/

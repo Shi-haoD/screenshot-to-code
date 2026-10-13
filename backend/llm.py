@@ -1,279 +1,193 @@
-import copy
 from enum import Enum
-import base64
-from typing import Any, Awaitable, Callable, List, cast
-from anthropic import AsyncAnthropic
-from openai import AsyncOpenAI
-from openai.types.chat import ChatCompletionMessageParam, ChatCompletionChunk
-from config import IS_DEBUG_ENABLED
-from debug.DebugFileWriter import DebugFileWriter
-from image_processing.utils import process_image
-from google import genai
-from google.genai import types
-
-from utils import pprint_prompt
+from typing import TypedDict
 
 
 # Actual model versions that are passed to the LLMs and stored in our logs
 class Llm(Enum):
-    GPT_4_VISION = "gpt-4-vision-preview"
-    GPT_4_TURBO_2024_04_09 = "gpt-4-turbo-2024-04-09"
-    GPT_4O_2024_05_13 = "gpt-4o-2024-05-13"
-    GPT_4O_2024_08_06 = "gpt-4o-2024-08-06"
-    GPT_4O_2024_11_20 = "gpt-4o-2024-11-20"
-    CLAUDE_3_SONNET = "claude-3-sonnet-20240229"
-    CLAUDE_3_OPUS = "claude-3-opus-20240229"
-    CLAUDE_3_HAIKU = "claude-3-haiku-20240307"
-    CLAUDE_3_5_SONNET_2024_06_20 = "claude-3-5-sonnet-20240620"
-    CLAUDE_3_5_SONNET_2024_10_22 = "claude-3-5-sonnet-20241022"
-    GEMINI_2_0_FLASH_EXP = "gemini-2.0-flash-exp"
-    O1_2024_12_17 = "o1-2024-12-17"
+    # GPT
+    GPT_5_4_MINI_LOW = "gpt-5.4-mini (low thinking)"
+    GPT_5_4_2026_03_05_NONE = "gpt-5.4-2026-03-05 (no thinking)"
+    GPT_5_4_2026_03_05_LOW = "gpt-5.4-2026-03-05 (low thinking)"
+    GPT_5_4_2026_03_05_MEDIUM = "gpt-5.4-2026-03-05 (medium thinking)"
+    GPT_5_4_2026_03_05_HIGH = "gpt-5.4-2026-03-05 (high thinking)"
+    GPT_5_4_2026_03_05_XHIGH = "gpt-5.4-2026-03-05 (xhigh thinking)"
+    GPT_5_5_NONE = "gpt-5.5 (no thinking)"
+    GPT_5_5_LOW = "gpt-5.5 (low thinking)"
+    GPT_5_5_MEDIUM = "gpt-5.5 (medium thinking)"
+    GPT_5_5_HIGH = "gpt-5.5 (high thinking)"
+    GPT_5_5_XHIGH = "gpt-5.5 (xhigh thinking)"
+    GPT_5_6_SOL_NONE = "gpt-5.6-sol (no thinking)"
+    GPT_5_6_SOL_LOW = "gpt-5.6-sol (low thinking)"
+    GPT_5_6_SOL_MEDIUM = "gpt-5.6-sol (medium thinking)"
+    GPT_5_6_SOL_HIGH = "gpt-5.6-sol (high thinking)"
+    GPT_5_6_SOL_XHIGH = "gpt-5.6-sol (xhigh thinking)"
+    GPT_5_6_SOL_MAX = "gpt-5.6-sol (max thinking)"
+    GPT_5_6_TERRA_LOW = "gpt-5.6-terra (low thinking)"
+    GPT_6_1_SOL_LOW = "gpt-6.1-sol (low thinking)"
+    GPT_6_1_SOL_MEDIUM = "gpt-6.1-sol (medium thinking)"
+    GPT_6_1_SOL_HIGH = "gpt-6.1-sol (high thinking)"
+    GPT_6_1_SOL_XHIGH = "gpt-6.1-sol (xhigh thinking)"
+    GPT_6_1_SOL_MAX = "gpt-6.1-sol (max thinking)"
+    # Claude
+    CLAUDE_SONNET_4_6 = "claude-sonnet-4-6"
+    CLAUDE_OPUS_5_5_LOW = "claude-opus-5-5 (low effort)"
+    CLAUDE_OPUS_5_5_MEDIUM = "claude-opus-5-5 (medium effort)"
+    CLAUDE_OPUS_5_5_HIGH = "claude-opus-5-5 (high effort)"
+    CLAUDE_OPUS_5_5_XHIGH = "claude-opus-5-5 (xhigh effort)"
+    CLAUDE_OPUS_5_5_MAX = "claude-opus-5-5 (max effort)"
+    CLAUDE_OPUS_5_LOW = "claude-opus-5 (low effort)"
+    CLAUDE_OPUS_5_MEDIUM = "claude-opus-5 (medium effort)"
+    CLAUDE_OPUS_5_HIGH = "claude-opus-5 (high effort)"
+    CLAUDE_OPUS_5_XHIGH = "claude-opus-5 (xhigh effort)"
+    CLAUDE_OPUS_5_MAX = "claude-opus-5 (max effort)"
+    CLAUDE_OPUS_4_8_LOW = "claude-opus-4-8 (low effort)"
+    CLAUDE_OPUS_4_8_MEDIUM = "claude-opus-4-8 (medium effort)"
+    CLAUDE_OPUS_4_8_HIGH = "claude-opus-4-8 (high effort)"
+    CLAUDE_OPUS_4_8_XHIGH = "claude-opus-4-8 (xhigh effort)"
+    CLAUDE_OPUS_4_8_MAX = "claude-opus-4-8 (max effort)"
+    CLAUDE_FABLE_5_LOW = "claude-fable-5 (low effort)"
+    CLAUDE_FABLE_5_MEDIUM = "claude-fable-5 (medium effort)"
+    CLAUDE_FABLE_5_HIGH = "claude-fable-5 (high effort)"
+    CLAUDE_FABLE_5_XHIGH = "claude-fable-5 (xhigh effort)"
+    CLAUDE_FABLE_5_MAX = "claude-fable-5 (max effort)"
+    # Gemini
+    GEMINI_3_FLASH_PREVIEW_HIGH = "gemini-3-flash-preview (high thinking)"
+    GEMINI_3_FLASH_PREVIEW_MINIMAL = "gemini-3-flash-preview (minimal thinking)"
+    GEMINI_3_1_PRO_PREVIEW_HIGH = "gemini-3.1-pro-preview (high thinking)"
+    GEMINI_3_1_PRO_PREVIEW_MEDIUM = "gemini-3.1-pro-preview (medium thinking)"
+    GEMINI_3_1_PRO_PREVIEW_LOW = "gemini-3.1-pro-preview (low thinking)"
+    GEMINI_3_5_FLASH_HIGH = "gemini-3.5-flash (high thinking)"
+    GEMINI_3_5_FLASH_MEDIUM = "gemini-3.5-flash (medium thinking)"
+    GEMINI_3_5_FLASH_LOW = "gemini-3.5-flash (low thinking)"
+    GEMINI_3_5_FLASH_MINIMAL = "gemini-3.5-flash (minimal thinking)"
+    GEMINI_3_6_FLASH_HIGH = "gemini-3.6-flash (high thinking)"
+    GEMINI_3_6_FLASH_MEDIUM = "gemini-3.6-flash (medium thinking)"
+    GEMINI_3_6_FLASH_LOW = "gemini-3.6-flash (low thinking)"
+    GEMINI_3_6_FLASH_MINIMAL = "gemini-3.6-flash (minimal thinking)"
 
 
-async def stream_openai_response(
-    messages: List[ChatCompletionMessageParam],
-    api_key: str,
-    base_url: str | None,
-    callback: Callable[[str], Awaitable[None]],
-    model: Llm,
-) -> str:
-    client = AsyncOpenAI(api_key=api_key, base_url=base_url)
-
-    # Base parameters
-    params = {
-        "model": model.value,
-        "messages": messages,
-        "stream": True,
-        "timeout": 600,
-        "temperature": 0.0,
-    }
-
-    # Add 'max_tokens' only if the model is a GPT4 vision or Turbo model
-    if (
-        model == Llm.GPT_4_VISION
-        or model == Llm.GPT_4_TURBO_2024_04_09
-        or model == Llm.GPT_4O_2024_05_13
-    ):
-        params["max_tokens"] = 4096
-
-    if model == Llm.GPT_4O_2024_11_20:
-        params["max_tokens"] = 16384
-
-    stream = await client.chat.completions.create(**params)  # type: ignore
-    full_response = ""
-    async for chunk in stream:  # type: ignore
-        assert isinstance(chunk, ChatCompletionChunk)
-        if (
-            chunk.choices
-            and len(chunk.choices) > 0
-            and chunk.choices[0].delta
-            and chunk.choices[0].delta.content
-        ):
-            content = chunk.choices[0].delta.content or ""
-            full_response += content
-            await callback(content)
-
-    await client.close()
-
-    return full_response
+class Completion(TypedDict):
+    duration: float
+    code: str
 
 
-# TODO: Have a seperate function that translates OpenAI messages to Claude messages
-async def stream_claude_response(
-    messages: List[ChatCompletionMessageParam],
-    api_key: str,
-    callback: Callable[[str], Awaitable[None]],
-    model: Llm,
-) -> str:
+# Explicitly map each model to the provider backing it.  This keeps provider
+# groupings authoritative and avoids relying on name conventions when checking
+# models elsewhere in the codebase.
+MODEL_PROVIDER: dict[Llm, str] = {
+    # OpenAI models
+    Llm.GPT_5_4_MINI_LOW: "openai",
+    Llm.GPT_5_4_2026_03_05_NONE: "openai",
+    Llm.GPT_5_4_2026_03_05_LOW: "openai",
+    Llm.GPT_5_4_2026_03_05_MEDIUM: "openai",
+    Llm.GPT_5_4_2026_03_05_HIGH: "openai",
+    Llm.GPT_5_4_2026_03_05_XHIGH: "openai",
+    Llm.GPT_5_5_NONE: "openai",
+    Llm.GPT_5_5_LOW: "openai",
+    Llm.GPT_5_5_MEDIUM: "openai",
+    Llm.GPT_5_5_HIGH: "openai",
+    Llm.GPT_5_5_XHIGH: "openai",
+    Llm.GPT_5_6_SOL_NONE: "openai",
+    Llm.GPT_5_6_SOL_LOW: "openai",
+    Llm.GPT_5_6_SOL_MEDIUM: "openai",
+    Llm.GPT_5_6_SOL_HIGH: "openai",
+    Llm.GPT_5_6_SOL_XHIGH: "openai",
+    Llm.GPT_5_6_SOL_MAX: "openai",
+    Llm.GPT_5_6_TERRA_LOW: "openai",
+    Llm.GPT_6_1_SOL_LOW: "openai",
+    Llm.GPT_6_1_SOL_MEDIUM: "openai",
+    Llm.GPT_6_1_SOL_HIGH: "openai",
+    Llm.GPT_6_1_SOL_XHIGH: "openai",
+    Llm.GPT_6_1_SOL_MAX: "openai",
+    # Anthropic models
+    Llm.CLAUDE_SONNET_4_6: "anthropic",
+    Llm.CLAUDE_OPUS_5_5_LOW: "anthropic",
+    Llm.CLAUDE_OPUS_5_5_MEDIUM: "anthropic",
+    Llm.CLAUDE_OPUS_5_5_HIGH: "anthropic",
+    Llm.CLAUDE_OPUS_5_5_XHIGH: "anthropic",
+    Llm.CLAUDE_OPUS_5_5_MAX: "anthropic",
+    Llm.CLAUDE_OPUS_5_LOW: "anthropic",
+    Llm.CLAUDE_OPUS_5_MEDIUM: "anthropic",
+    Llm.CLAUDE_OPUS_5_HIGH: "anthropic",
+    Llm.CLAUDE_OPUS_5_XHIGH: "anthropic",
+    Llm.CLAUDE_OPUS_5_MAX: "anthropic",
+    Llm.CLAUDE_OPUS_4_8_LOW: "anthropic",
+    Llm.CLAUDE_OPUS_4_8_MEDIUM: "anthropic",
+    Llm.CLAUDE_OPUS_4_8_HIGH: "anthropic",
+    Llm.CLAUDE_OPUS_4_8_XHIGH: "anthropic",
+    Llm.CLAUDE_OPUS_4_8_MAX: "anthropic",
+    Llm.CLAUDE_FABLE_5_LOW: "anthropic",
+    Llm.CLAUDE_FABLE_5_MEDIUM: "anthropic",
+    Llm.CLAUDE_FABLE_5_HIGH: "anthropic",
+    Llm.CLAUDE_FABLE_5_XHIGH: "anthropic",
+    Llm.CLAUDE_FABLE_5_MAX: "anthropic",
+    # Gemini models
+    Llm.GEMINI_3_FLASH_PREVIEW_HIGH: "gemini",
+    Llm.GEMINI_3_FLASH_PREVIEW_MINIMAL: "gemini",
+    Llm.GEMINI_3_1_PRO_PREVIEW_HIGH: "gemini",
+    Llm.GEMINI_3_1_PRO_PREVIEW_MEDIUM: "gemini",
+    Llm.GEMINI_3_1_PRO_PREVIEW_LOW: "gemini",
+    Llm.GEMINI_3_5_FLASH_HIGH: "gemini",
+    Llm.GEMINI_3_5_FLASH_MEDIUM: "gemini",
+    Llm.GEMINI_3_5_FLASH_LOW: "gemini",
+    Llm.GEMINI_3_5_FLASH_MINIMAL: "gemini",
+    Llm.GEMINI_3_6_FLASH_HIGH: "gemini",
+    Llm.GEMINI_3_6_FLASH_MEDIUM: "gemini",
+    Llm.GEMINI_3_6_FLASH_LOW: "gemini",
+    Llm.GEMINI_3_6_FLASH_MINIMAL: "gemini",
+}
 
-    client = AsyncAnthropic(api_key=api_key)
+# Convenience sets for membership checks
+OPENAI_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "openai"}
+ANTHROPIC_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "anthropic"}
+GEMINI_MODELS = {m for m, p in MODEL_PROVIDER.items() if p == "gemini"}
 
-    # Base parameters
-    max_tokens = 8192
-    temperature = 0.0
-
-    # Translate OpenAI messages to Claude messages
-
-    # Deep copy messages to avoid modifying the original list
-    cloned_messages = copy.deepcopy(messages)
-
-    system_prompt = cast(str, cloned_messages[0].get("content"))
-    claude_messages = [dict(message) for message in cloned_messages[1:]]
-    for message in claude_messages:
-        if not isinstance(message["content"], list):
-            continue
-
-        for content in message["content"]:  # type: ignore
-            if content["type"] == "image_url":
-                content["type"] = "image"
-
-                # Extract base64 data and media type from data URL
-                # Example base64 data URL: data:image/png;base64,iVBOR...
-                image_data_url = cast(str, content["image_url"]["url"])
-
-                # Process image and split media type and data
-                # so it works with Claude (under 5mb in base64 encoding)
-                (media_type, base64_data) = process_image(image_data_url)
-
-                # Remove OpenAI parameter
-                del content["image_url"]
-
-                content["source"] = {
-                    "type": "base64",
-                    "media_type": media_type,
-                    "data": base64_data,
-                }
-
-    # Stream Claude response
-    async with client.messages.stream(
-        model=model.value,
-        max_tokens=max_tokens,
-        temperature=temperature,
-        system=system_prompt,
-        messages=claude_messages,  # type: ignore
-        extra_headers={"anthropic-beta": "max-tokens-3-5-sonnet-2024-07-15"},
-    ) as stream:
-        async for text in stream.text_stream:
-            await callback(text)
-
-    # Return final message
-    response = await stream.get_final_message()
-
-    # Close the Anthropic client
-    await client.close()
-
-    return response.content[0].text
-
-
-async def stream_claude_response_native(
-    system_prompt: str,
-    messages: list[Any],
-    api_key: str,
-    callback: Callable[[str], Awaitable[None]],
-    include_thinking: bool = False,
-    model: Llm = Llm.CLAUDE_3_OPUS,
-) -> str:
-
-    client = AsyncAnthropic(api_key=api_key)
-
-    # Base model parameters
-    max_tokens = 4096
-    temperature = 0.0
-
-    # Multi-pass flow
-    current_pass_num = 1
-    max_passes = 2
-
-    prefix = "<thinking>"
-    response = None
-
-    # For debugging
-    full_stream = ""
-    debug_file_writer = DebugFileWriter()
-
-    while current_pass_num <= max_passes:
-        current_pass_num += 1
-
-        # Set up message depending on whether we have a <thinking> prefix
-        messages_to_send = (
-            messages + [{"role": "assistant", "content": prefix}]
-            if include_thinking
-            else messages
-        )
-
-        pprint_prompt(messages_to_send)
-
-        async with client.messages.stream(
-            model=model.value,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system_prompt,
-            messages=messages_to_send,  # type: ignore
-        ) as stream:
-            async for text in stream.text_stream:
-                print(text, end="", flush=True)
-                full_stream += text
-                await callback(text)
-
-        response = await stream.get_final_message()
-        response_text = response.content[0].text
-
-        # Write each pass's code to .html file and thinking to .txt file
-        if IS_DEBUG_ENABLED:
-            debug_file_writer.write_to_file(
-                f"pass_{current_pass_num - 1}.html",
-                debug_file_writer.extract_html_content(response_text),
-            )
-            debug_file_writer.write_to_file(
-                f"thinking_pass_{current_pass_num - 1}.txt",
-                response_text.split("</thinking>")[0],
-            )
-
-        # Set up messages array for next pass
-        messages += [
-            {"role": "assistant", "content": str(prefix) + response.content[0].text},
-            {
-                "role": "user",
-                "content": "You've done a good job with a first draft. Improve this further based on the original instructions so that the app is fully functional and looks like the original video of the app we're trying to replicate.",
-            },
-        ]
-
-        print(
-            f"Token usage: Input Tokens: {response.usage.input_tokens}, Output Tokens: {response.usage.output_tokens}"
-        )
-
-    # Close the Anthropic client
-    await client.close()
-
-    if IS_DEBUG_ENABLED:
-        debug_file_writer.write_to_file("full_stream.txt", full_stream)
-
-    if not response:
-        raise Exception("No HTML response found in AI response")
-    else:
-        return response.content[0].text  # type: ignore
+OPENAI_MODEL_CONFIG: dict[Llm, dict[str, str]] = {
+    Llm.GPT_5_4_MINI_LOW: {"api_name": "gpt-5.4-mini", "reasoning_effort": "low"},
+    Llm.GPT_5_4_2026_03_05_NONE: {
+        "api_name": "gpt-5.4-2026-03-05",
+        "reasoning_effort": "none",
+    },
+    Llm.GPT_5_4_2026_03_05_LOW: {
+        "api_name": "gpt-5.4-2026-03-05",
+        "reasoning_effort": "low",
+    },
+    Llm.GPT_5_4_2026_03_05_MEDIUM: {
+        "api_name": "gpt-5.4-2026-03-05",
+        "reasoning_effort": "medium",
+    },
+    Llm.GPT_5_4_2026_03_05_HIGH: {
+        "api_name": "gpt-5.4-2026-03-05",
+        "reasoning_effort": "high",
+    },
+    Llm.GPT_5_4_2026_03_05_XHIGH: {
+        "api_name": "gpt-5.4-2026-03-05",
+        "reasoning_effort": "xhigh",
+    },
+    Llm.GPT_5_5_NONE: {"api_name": "gpt-5.5", "reasoning_effort": "none"},
+    Llm.GPT_5_5_LOW: {"api_name": "gpt-5.5", "reasoning_effort": "low"},
+    Llm.GPT_5_5_MEDIUM: {"api_name": "gpt-5.5", "reasoning_effort": "medium"},
+    Llm.GPT_5_5_HIGH: {"api_name": "gpt-5.5", "reasoning_effort": "high"},
+    Llm.GPT_5_5_XHIGH: {"api_name": "gpt-5.5", "reasoning_effort": "xhigh"},
+    Llm.GPT_5_6_SOL_NONE: {"api_name": "gpt-5.6-sol", "reasoning_effort": "none"},
+    Llm.GPT_5_6_SOL_LOW: {"api_name": "gpt-5.6-sol", "reasoning_effort": "low"},
+    Llm.GPT_5_6_SOL_MEDIUM: {"api_name": "gpt-5.6-sol", "reasoning_effort": "medium"},
+    Llm.GPT_5_6_SOL_HIGH: {"api_name": "gpt-5.6-sol", "reasoning_effort": "high"},
+    Llm.GPT_5_6_SOL_XHIGH: {"api_name": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+    Llm.GPT_5_6_SOL_MAX: {"api_name": "gpt-5.6-sol", "reasoning_effort": "max"},
+    Llm.GPT_5_6_TERRA_LOW: {"api_name": "gpt-5.6-terra", "reasoning_effort": "low"},
+    # gpt-6.1-sol does not support the "none" reasoning effort.
+    Llm.GPT_6_1_SOL_LOW: {"api_name": "gpt-6.1-sol", "reasoning_effort": "low"},
+    Llm.GPT_6_1_SOL_MEDIUM: {"api_name": "gpt-6.1-sol", "reasoning_effort": "medium"},
+    Llm.GPT_6_1_SOL_HIGH: {"api_name": "gpt-6.1-sol", "reasoning_effort": "high"},
+    Llm.GPT_6_1_SOL_XHIGH: {"api_name": "gpt-6.1-sol", "reasoning_effort": "xhigh"},
+    Llm.GPT_6_1_SOL_MAX: {"api_name": "gpt-6.1-sol", "reasoning_effort": "max"},
+}
 
 
-async def stream_gemini_response(
-    messages: List[ChatCompletionMessageParam],
-    api_key: str,
-    callback: Callable[[str], Awaitable[None]],
-    model: Llm,
-) -> str:
+def get_openai_api_name(model: Llm) -> str:
+    return OPENAI_MODEL_CONFIG[model]["api_name"]
 
-    # Extract image URLs from messages
-    image_urls = []
-    for content_part in messages[-1]["content"]:  # type: ignore
-        if content_part["type"] == "image_url":  # type: ignore
-            image_url = content_part["image_url"]["url"]  # type: ignore
-            if image_url.startswith("data:"):  # type: ignore
-                # Extract base64 data and mime type for data URLs
-                mime_type = image_url.split(";")[0].split(":")[1]  # type: ignore
-                base64_data = image_url.split(",")[1]  # type: ignore
-                image_urls = [{"mime_type": mime_type, "data": base64_data}]  # type: ignore
-            else:
-                # Store regular URLs
-                image_urls = [{"uri": image_url}]  # type: ignore
-            break  # Exit after first image URL
 
-    client = genai.Client(api_key=api_key)  # type: ignore
-    full_response = ""
-    async for response in client.aio.models.generate_content_stream(  # type: ignore
-        model=model.value,
-        contents={
-            "parts": [
-                {"text": messages[0]["content"]},  # type: ignore
-                types.Part.from_bytes(  # type: ignore
-                    data=base64.b64decode(image_urls[0]["data"]),  # type: ignore
-                    mime_type=image_urls[0]["mime_type"],  # type: ignore
-                ),
-            ]  # type: ignore
-        },  # type: ignore
-        config=types.GenerateContentConfig(  # type: ignore
-            temperature=0, max_output_tokens=8192
-        ),
-    ):  # type: ignore
-        if response.text:  # type: ignore
-            full_response += response.text  # type: ignore
-            await callback(response.text)  # type: ignore
-    return full_response  # type: ignore
+def get_openai_reasoning_effort(model: Llm) -> str | None:
+    return OPENAI_MODEL_CONFIG.get(model, {}).get("reasoning_effort")
